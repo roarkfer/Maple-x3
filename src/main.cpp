@@ -47,9 +47,42 @@ void saveData(){
 void loadData(){
  prefs.begin("maple",false);String json=prefs.getString("data","");
  if(!json.length())return;JsonDocument d;if(deserializeJson(d,json))return;
- taskCount=0;for(JsonObject o:d["tasks"].as<JsonArray>()){if(taskCount>=MAX_TASKS)break;tasks[taskCount++]={String((const char*)o["t"]|""),bool(o["d"]|false)};}
- habitCount=0;for(JsonObject o:d["habits"].as<JsonArray>()){if(habitCount>=MAX_HABITS)break;habits[habitCount].name=String((const char*)o["n"]|"");habits[habitCount].marks=o["m"]|0u;habitCount++;}
- folderCount=0;for(JsonObject fo:d["folders"].as<JsonArray>()){if(folderCount>=MAX_FOLDERS)break;Folder& f=folders[folderCount++];f.name=String((const char*)fo["n"]|"");f.count=0;for(JsonObject e:fo["e"].as<JsonArray>()){if(f.count>=MAX_EXERCISES)break;f.ex[f.count].name=String((const char*)e["n"]|"");f.ex[f.count].sets=e["s"]|4;f.ex[f.count].reps=e["r"]|12;f.ex[f.count].kg=e["k"]|10;f.count++;}}
+ taskCount = 0;
+for (JsonObject o : d["tasks"].as<JsonArray>()) {
+  if (taskCount >= MAX_TASKS) break;
+
+  tasks[taskCount].text = String(o["t"] | "");
+  tasks[taskCount].done = o["d"] | false;
+  taskCount++;
+}
+
+habitCount = 0;
+for (JsonObject o : d["habits"].as<JsonArray>()) {
+  if (habitCount >= MAX_HABITS) break;
+
+  habits[habitCount].name = String(o["n"] | "");
+  habits[habitCount].marks = o["m"] | 0u;
+  habitCount++;
+}
+
+folderCount = 0;
+for (JsonObject fo : d["folders"].as<JsonArray>()) {
+  if (folderCount >= MAX_FOLDERS) break;
+
+  Folder& f = folders[folderCount++];
+  f.name = String(fo["n"] | "");
+  f.count = 0;
+
+  for (JsonObject e : fo["e"].as<JsonArray>()) {
+    if (f.count >= MAX_EXERCISES) break;
+
+    f.ex[f.count].name = String(e["n"] | "");
+    f.ex[f.count].sets = e["s"] | 4;
+    f.ex[f.count].reps = e["r"] | 12;
+    f.ex[f.count].kg = e["k"] | 10;
+    f.count++;
+  }
+}
 }
 template<typename T> void moveItem(T* a,int n,int from,int to){if(to<0||to>=n)return;T tmp=a[from];if(to<from)for(int i=from;i>to;--i)a[i]=a[i-1];else for(int i=from;i<to;++i)a[i]=a[i+1];a[to]=tmp;}
 int itemCount(){if(tab==Tab::Tasks)return taskCount;if(tab==Tab::Habits)return habitCount;if(openFolder>=0)return folders[openFolder].count;return folderCount;}
