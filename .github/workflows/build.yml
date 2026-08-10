@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +21,11 @@ jobs:
 
       - name: Download pinned FreeInk SDK
         run: bash setup-freeink.sh
+
+      - name: Fix ArduinoJson name collision
+        run: |
+          sed -i 's/\<detail\>/activeDetail/g' src/main.cpp
+          grep -n "activeDetail" src/main.cpp | head -30
 
       - name: Build Maple X3 Receiver
         run: pio run -e xteink_x3
