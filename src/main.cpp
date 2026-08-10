@@ -19,7 +19,7 @@
 // Maple acknowledges it during the next synchronization.
 // -----------------------------------------------------------------------------
 
-static constexpr const char* FW_VERSION = "0.2.0";
+static constexpr const char* FW_VERSION = "0.2.1";
 static constexpr int MAPLE_PROTOCOL = 1;
 static constexpr const char* AP_SSID = "Maple-X3";
 static constexpr const char* MDNS_HOST = "maple-x3";
@@ -454,10 +454,6 @@ static void handleChanges() {
 }
 
 static void handlePostState() {
-  if (!storageReady) {
-    sendJson(507, "{\"ok\":false,\"error\":\"storage unavailable\"}");
-    return;
-  }
   const String body = server.arg("plain");
   if (body.length() < 10) {
     sendJson(400, "{\"ok\":false,\"error\":\"empty state\"}");
@@ -469,9 +465,24 @@ static void handlePostState() {
     sendJson(400, "{\"ok\":false,\"error\":\"invalid protocol or revision\"}");
     return;
   }
-  if (!writeRawStateAtomic(body)) {
-    sendJson(507, "{\"ok\":false,\"error\":\"could not persist state\"}");
-    return;
+
+  // Prefer SD when available. Without SD, keep the state in RAM so Maple X3
+  // remains fully usable until the device is restarted.
+  if (storageReady) {
+    if (!writeRawStateAtomic(body)) {
+      sendJson(507, "{\"ok\":false,\"error\":\"could not persist state\"}");
+      return;
+    }
+  } else {
+    stateDoc.clear();
+    const DeserializationError err = deserializeJson(stateDoc, body);
+    if (err || (stateDoc["protocol"] | 0) != MAPLE_PROTOCOL) {
+      stateDoc.clear();
+      stateLoaded = false;
+      sendJson(400, "{\"ok\":false,\"error\":\"invalid state\"}");
+      return;
+    }
+    stateLoaded = true;
   }
 
   uint32_t ack = 0;
@@ -480,7 +491,7 @@ static void handlePostState() {
   }
   currentRevision = static_cast<uint32_t>(revision);
   acknowledgeChanges(ack, currentRevision);
-  reloadStatePending = true;  // Parse after the HTTP body String is released.
+  reloadStatePending = true;
 
   JsonDocument response;
   response["ok"] = true;
@@ -1221,7 +1232,8 @@ void loop() {
 
   if (reloadStatePending) {
     reloadStatePending = false;
-    if (loadState()) {
+    const bool loaded = storageReady ? loadState() : stateLoaded;
+    if (loaded) {
       // A fresh state from Maple resets navigation but never removes unacked deltas.
       goRootPage(Page::Today);
       render();
