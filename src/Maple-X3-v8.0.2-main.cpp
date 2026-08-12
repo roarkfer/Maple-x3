@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <SPI.h>
-#include <WiFi.h>
-#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
@@ -16,7 +14,7 @@
 // Data-compatible with Maple v8 JSON packages.
 // No Wi-Fi dependency: state, import and export live on microSD.
 
-static constexpr const char* FW_VERSION = "8.1.0";
+static constexpr const char* FW_VERSION = "8.0.2";
 static constexpr const char* MAPLE_DIR = "/Maple";
 static constexpr const char* STATE_PATH = "/Maple/maple-x3-state.json";
 static constexpr const char* STATE_TMP_PATH = "/Maple/maple-x3-state.tmp";
@@ -43,17 +41,6 @@ bool darkMode = false;
 uint64_t baseEpochMs = 0;
 uint32_t baseMillis = 0;
 String lastPurgeDay;
-
-// Temporary Wi-Fi sharing mode. The X3 creates its own local network only while
-// this mode is active; Maple itself remains fully offline/SD-backed.
-static constexpr const char* SHARE_AP_SSID = "Maple-X3";
-static constexpr uint32_t POWER_LONG_PRESS_MS = 800;
-WebServer shareServer(80);
-bool wifiShareMode = false;
-bool shareRoutesReady = false;
-FsFile webUploadFile;
-String webUploadPath;
-String webNotice;
 
 
 // -----------------------------------------------------------------------------
@@ -960,161 +947,6 @@ static void handleLeftRight(int delta){
   if(view==View::RecurYear){recurPickMonth=(recurPickMonth+delta+12)%12;render();return;}
 }
 
-// -----------------------------------------------------------------------------
-// Wi-Fi SD sharing mode
-// -----------------------------------------------------------------------------
-static bool isJsonName(const String& name){
-  String low=name;low.toLowerCase();return low.endsWith(".json");
-}
-
-static String sanitizeUploadName(String name){
-  int slash=name.lastIndexOf('/');int back=name.lastIndexOf('\\');int cut=max(slash,back);
-  if(cut>=0)name=name.substring(cut+1);
-  String out;out.reserve(name.length());
-  for(size_t i=0;i<name.length();++i){char c=name[i];
-    bool ok=(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.';
-    if(ok)out+=c;else if(c==' ')out+='-';
-  }
-  if(!out.length())out="maple-import.json";
-  return out;
-}
-
-static String htmlEscape(const String& in){
-  String out;out.reserve(in.length()+16);
-  for(size_t i=0;i<in.length();++i){char c=in[i];
-    if(c=='&')out+="&amp;";else if(c=='<')out+="&lt;";else if(c=='>')out+="&gt;";
-    else if(c=='\"')out+="&quot;";else if(c=='\'')out+="&#39;";else out+=c;
-  }
-  return out;
-}
-
-static bool isManagedJsonPath(const String& path){
-  if(path.indexOf("..")>=0||!path.startsWith("/")||!isJsonName(path))return false;
-  return path.startsWith("/Maple/Import/")||path.startsWith("/Maple/Exports/")||
-         (path.startsWith("/Maple/")&&path.indexOf('/',7)<0)||path.indexOf('/',1)<0;
-}
-
-static bool isProtectedJsonPath(const String& path){
-  return path==STATE_PATH||path==STATE_TMP_PATH;
-}
-
-static void appendJsonDirectory(String& html,const char* dir){
-  if(!storageReady)return;
-  auto files=SdMan.listFiles(dir,60);
-  for(const String& name:files){
-    if(!isJsonName(name))continue;
-    String full=String(dir);
-    if(full!="/"&&!full.endsWith("/"))full+="/";
-    full+=name;
-    html+="<div class='file'><div><strong>"+htmlEscape(name)+"</strong><small>"+htmlEscape(full)+"</small></div>";
-    if(isProtectedJsonPath(full))html+="<span class='protected'>EN USO</span>";
-    else html+="<form method='POST' action='/delete' onsubmit=\"return confirm('¿Eliminar este JSON?');\"><input type='hidden' name='path' value='"+htmlEscape(full)+"'><button class='danger' type='submit'>Eliminar</button></form>";
-    html+="</div>";
-  }
-}
-
-static void sendShareHome(){
-  String html;html.reserve(14000);
-  html=F("<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Maple X3</title><style>"
-         "*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7f7f3;color:#171717;margin:0;padding:24px}main{max-width:720px;margin:auto}h1{font-size:28px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 10px}p{line-height:1.45;color:#555}.card{background:#fff;border:1px solid #d8d8d2;border-radius:14px;padding:16px;margin:14px 0}.upload{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.file{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid #ecece7;padding:12px 0}.file:first-child{border-top:0}.file small{display:block;color:#777;margin-top:3px;word-break:break-all}button{font:inherit;border:1px solid #222;border-radius:9px;background:#222;color:#fff;padding:9px 13px}button.danger{background:#fff;color:#8c1d18;border-color:#c9a29f}.protected{font-size:12px;color:#777;border:1px solid #ccc;border-radius:999px;padding:5px 8px}.notice{background:#eef6e9;border:1px solid #b9d6ab;border-radius:10px;padding:10px 12px}.meta{font-size:13px;color:#777}input[type=file]{max-width:100%}a{color:inherit}</style></head><body><main>"
-         "<h1>Maple X3</h1><div class='meta'>Administrador local de JSON · microSD</div>"
-         "<p>Esta página vive dentro del XTEINK X3. No necesita Internet. Los JSON nuevos se guardan en <b>/Maple/Import/</b> para que luego puedas importarlos desde Maple.</p>");
-  if(webNotice.length()){html+="<div class='notice'>"+htmlEscape(webNotice)+"</div>";webNotice="";}
-  html+=F("<div class='card'><h2 style='margin-top:0'>Agregar JSON</h2><form class='upload' method='POST' action='/upload' enctype='multipart/form-data'><input type='file' name='file' accept='.json,application/json' required><button type='submit'>Subir a la SD</button></form></div>"
-          "<h2>Archivos JSON</h2><div class='card'>");
-  appendJsonDirectory(html,"/Maple/Import");
-  appendJsonDirectory(html,"/Maple/Exports");
-  appendJsonDirectory(html,"/Maple");
-  appendJsonDirectory(html,"/");
-  html+=F("</div><p class='meta'>El archivo interno <b>maple-x3-state.json</b> aparece como EN USO y no se puede borrar desde esta página.</p>"
-          "<p><a href='/'>Actualizar lista</a></p></main></body></html>");
-  shareServer.send(200,"text/html; charset=utf-8",html);
-}
-
-static void handleWebDelete(){
-  if(!storageReady){shareServer.send(503,"text/plain; charset=utf-8","SD no disponible");return;}
-  String path=shareServer.arg("path");
-  if(!isManagedJsonPath(path)||isProtectedJsonPath(path)){shareServer.send(400,"text/plain; charset=utf-8","Ruta no permitida");return;}
-  if(!SdMan.exists(path.c_str())){webNotice="El archivo ya no existe.";}
-  else if(SdMan.remove(path.c_str()))webNotice="JSON eliminado: "+path;
-  else webNotice="No se pudo eliminar: "+path;
-  shareServer.sendHeader("Location","/");shareServer.send(303,"text/plain","");
-}
-
-static void handleWebUploadData(){
-  HTTPUpload& up=shareServer.upload();
-  if(up.status==UPLOAD_FILE_START){
-    webNotice="";webUploadPath="";
-    if(webUploadFile)webUploadFile.close();
-    if(!storageReady){webNotice="SD no disponible.";return;}
-    String clean=sanitizeUploadName(up.filename);
-    if(!isJsonName(clean)){webNotice="Solo se permiten archivos .json";return;}
-    SdMan.ensureDirectoryExists(IMPORT_DIR);
-    webUploadPath=String(IMPORT_DIR)+"/"+clean;
-    if(SdMan.exists(webUploadPath.c_str()))SdMan.remove(webUploadPath.c_str());
-    webUploadFile=SdMan.open(webUploadPath.c_str(),O_WRITE|O_CREAT|O_TRUNC);
-    if(!webUploadFile){webNotice="No se pudo crear el archivo en la SD.";webUploadPath="";}
-  }else if(up.status==UPLOAD_FILE_WRITE){
-    if(webUploadFile){size_t n=webUploadFile.write(up.buf,up.currentSize);if(n!=up.currentSize)webNotice="Error escribiendo el archivo.";}
-  }else if(up.status==UPLOAD_FILE_END){
-    if(webUploadFile)webUploadFile.close();
-    if(webUploadPath.length()&&!webNotice.length())webNotice="JSON agregado: "+webUploadPath;
-  }else if(up.status==UPLOAD_FILE_ABORTED){
-    if(webUploadFile)webUploadFile.close();
-    if(webUploadPath.length())SdMan.remove(webUploadPath.c_str());
-    webNotice="Carga cancelada.";
-  }
-}
-
-static void configureShareRoutes(){
-  if(shareRoutesReady)return;
-  shareServer.on("/",HTTP_GET,sendShareHome);
-  shareServer.on("/delete",HTTP_POST,handleWebDelete);
-  shareServer.on("/upload",HTTP_POST,[](){shareServer.sendHeader("Location","/");shareServer.send(303,"text/plain","");},handleWebUploadData);
-  shareServer.onNotFound([](){shareServer.sendHeader("Location","/");shareServer.send(302,"text/plain","");});
-  shareRoutesReady=true;
-}
-
-static void renderWifiShare(){
-  clearCanvas();
-  drawTextRaw("COMPARTIR WIFI",24,40,3,ink());
-  drawTextRaw("RED WIFI",24,125,1,ink());
-  drawTextRaw(SHARE_AP_SSID,24,150,3,ink());
-  drawTextRaw("ABRE EN TU TELEFONO",24,245,1,ink());
-  drawTextRaw("http://192.168.4.1",24,275,2,ink());
-  drawTextRaw("ADMINISTRA LOS JSON DE LA SD",24,350,1,ink());
-  drawTextRaw("SUBE NUEVOS O ELIMINA VIEJOS",24,375,1,ink());
-  drawTextRaw("NO HAY INTERNET: ES NORMAL",24,430,1,ink());
-  drawTextRaw("POWER = SALIR A HOY",24,730,1,ink());
-  display.displayBuffer(EInkDisplay::FULL_REFRESH);
-}
-
-static bool startWifiShare(){
-  if(wifiShareMode)return true;
-  if(!storageReady){showMessage("SD NO DISPONIBLE",View::Root);render();return false;}
-  configureShareRoutes();
-  WiFi.mode(WIFI_AP);
-  delay(50);
-  if(!WiFi.softAP(SHARE_AP_SSID)){showMessage("NO SE PUDO CREAR LA RED WIFI",View::Root);render();WiFi.mode(WIFI_OFF);return false;}
-  shareServer.begin();wifiShareMode=true;renderWifiShare();return true;
-}
-
-static void stopWifiShare(){
-  if(!wifiShareMode)return;
-  if(webUploadFile)webUploadFile.close();
-  shareServer.stop();WiFi.softAPdisconnect(true);WiFi.mode(WIFI_OFF);wifiShareMode=false;
-}
-
-static void handleShortPower(){
-  if(wifiShareMode)stopWifiShare();
-  goPage(Page::Today);render();
-}
-
-static void handleLongPower(){
-  if(wifiShareMode)return;
-  startWifiShare();
-}
-
 bool confirmPending=false;bool confirmLongFired=false;uint32_t confirmStarted=0;
 static void queueConfirm(){if(confirmPending)return;confirmPending=true;confirmLongFired=false;confirmStarted=millis();}
 static void serviceConfirmHold(){
@@ -1123,17 +955,7 @@ static void serviceConfirmHold(){
   if(!held){confirmPending=false;if(!confirmLongFired)handleShortConfirm();}
 }
 
-bool powerPending=false;bool powerLongFired=false;
-static void queuePower(){if(powerPending)return;powerPending=true;powerLongFired=false;}
-static void servicePowerHold(){
-  if(!powerPending)return;bool held=input.isPressed(InputManager::BTN_POWER);unsigned long age=input.getPowerButtonHeldTime();
-  if(held&&age>=POWER_LONG_PRESS_MS&&!powerLongFired){powerLongFired=true;powerPending=false;handleLongPower();return;}
-  if(!held){powerPending=false;if(!powerLongFired)handleShortPower();}
-}
-
 static void handleButton(uint8_t b){
-  if(b==InputManager::BTN_POWER){queuePower();return;}
-  if(wifiShareMode)return;
   if(b==InputManager::BTN_CONFIRM){if(view==View::Root||view==View::TextInput)queueConfirm();else handleShortConfirm();return;}
   if(b==InputManager::BTN_BACK){handleBack();return;}if(b==InputManager::BTN_UP){adjustCurrent(-1);return;}if(b==InputManager::BTN_DOWN){adjustCurrent(1);return;}if(b==InputManager::BTN_LEFT){handleLeftRight(-1);return;}if(b==InputManager::BTN_RIGHT){handleLeftRight(1);return;}
 }
@@ -1204,9 +1026,7 @@ void setup(){
 }
 
 void loop(){
-  if(wifiShareMode)shareServer.handleClient();
-  uint8_t b=0;while(input.popPress(b))handleButton(b);servicePowerHold();
-  if(!wifiShareMode)serviceConfirmHold();
-  static uint32_t lastMinute=0;if(!wifiShareMode&&millis()-lastMinute>60000){lastMinute=millis();applyRecurring();purgeCompletedAfter2am();}
+  uint8_t b=0;while(input.popPress(b))handleButton(b);serviceConfirmHold();
+  static uint32_t lastMinute=0;if(millis()-lastMinute>60000){lastMinute=millis();applyRecurring();purgeCompletedAfter2am();}
   delay(2);
 }
