@@ -436,7 +436,7 @@ static bool loadState() {
 enum class Page : uint8_t { Today=0, Habits=1, Tasks=2, Gym=3, Projects=4, Write=5 };
 enum class View : uint8_t {
   Root, HabitYear, GymFolder, GymExercise, Project, Notebook, NotebookTags, Grimorio,
-  Settings, EditMenu, TextInput, NumberInput,
+  Settings, EditMenu, TextInput, NumberInput, BleEditor,
   Transfer, ImportPicker, ExportSelect,
   RecurFreq, RecurWeek, RecurMonth, RecurYear,
   Message
@@ -814,7 +814,7 @@ static void drawGymCompactRow(int row, JsonObject e, bool selected){
   bool nameSelected=selected&&gymSetFocus<0;
   if(nameSelected)fillRect(leftX,y,nameW,50,ink());else if(selected)borderT(leftX,y,nameW,50,1);
   bool nameInk=nameSelected?paper():ink();
-  drawTextClipped(safeText(e,"name").c_str(),25,y+7,2,276,nameInk);
+  drawTextClipped(safeText(e,"name"),25,y+7,2,276,nameInk);
   String meta=String("REPS ")+String(e["reps"]|0)+"   "+String(e["kg"]|0)+" KG";
   drawTextClipped(meta.c_str(),25,y+31,1,276,nameInk);
 
