@@ -1,11 +1,6 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <SPI.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <NimBLEDevice.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
 #include <ArduinoJson.h>
 #include <BoardConfig.h>
 #include <EInkDisplay.h>
@@ -19,7 +14,7 @@
 // Data-compatible with Maple v8 JSON packages.
 // No Wi-Fi dependency: state, import and export live on microSD.
 
-static constexpr const char* FW_VERSION = "8.2.0";
+static constexpr const char* FW_VERSION = "8.0.2";
 static constexpr const char* MAPLE_DIR = "/Maple";
 static constexpr const char* STATE_PATH = "/Maple/maple-x3-state.json";
 static constexpr const char* STATE_TMP_PATH = "/Maple/maple-x3-state.tmp";
@@ -46,52 +41,6 @@ bool darkMode = false;
 uint64_t baseEpochMs = 0;
 uint32_t baseMillis = 0;
 String lastPurgeDay;
-
-// Temporary Wi-Fi sharing mode. The X3 creates its own local network only while
-// this mode is active; Maple itself remains fully offline/SD-backed.
-static constexpr const char* SHARE_AP_SSID = "Maple-X3";
-static constexpr uint32_t POWER_LONG_PRESS_MS = 800;
-WebServer shareServer(80);
-bool wifiShareMode = false;
-bool shareRoutesReady = false;
-FsFile webUploadFile;
-String webUploadPath;
-String webNotice;
-
-// -----------------------------------------------------------------------------
-// Gym compact-set focus + BLE keyboard editor
-// -----------------------------------------------------------------------------
-int gymSetFocus = -1; // -1 = exercise name, 0..sets-1 = set checkbox
-
-static constexpr uint32_t BLE_SCAN_TIME_MS = 15000;
-static constexpr uint32_t BLE_EDITOR_AUTOSAVE_MS = 3000;
-static constexpr uint32_t BLE_EDITOR_REFRESH_IDLE_MS = 700;
-
-struct BleKeyPacket {
-  uint8_t len;
-  uint8_t data[12];
-};
-
-QueueHandle_t bleKeyQueue = nullptr;
-bool bleInitialized = false;
-bool bleScanning = false;
-bool bleConnectPending = false;
-bool bleKeyboardConnected = false;
-bool bleEditorDirty = false;
-bool bleEditorCaps = false;
-char bleDeadKey = 0;
-int bleEditorNotebook = -1;
-int bleEditorCursor = 0;
-uint32_t bleEditorLastSave = 0;
-uint32_t bleEditorLastKey = 0;
-uint32_t bleEditorLastRender = 0;
-String bleEditorText;
-String bleStatus = "SIN CONEXION";
-String bleKeyboardName;
-
-const NimBLEAdvertisedDevice* bleAdvDevice = nullptr;
-NimBLEClient* bleClient = nullptr;
-uint8_t blePrevKeys[6] = {0,0,0,0,0,0};
 
 
 // -----------------------------------------------------------------------------
@@ -436,7 +385,7 @@ static bool loadState() {
 enum class Page : uint8_t { Today=0, Habits=1, Tasks=2, Gym=3, Projects=4, Write=5 };
 enum class View : uint8_t {
   Root, HabitYear, GymFolder, GymExercise, Project, Notebook, NotebookTags, Grimorio,
-  Settings, EditMenu, TextInput, NumberInput, BleEditor,
+  Settings, EditMenu, TextInput, NumberInput,
   Transfer, ImportPicker, ExportSelect,
   RecurFreq, RecurWeek, RecurMonth, RecurYear,
   Message
@@ -806,52 +755,11 @@ static void renderHabitYear(){
   int marked=0;for(JsonPair kv:h["marks"].as<JsonObject>()){if(!(kv.value()|false))continue;String k=kv.key().c_str();if(k.length()<10||k.substring(0,4).toInt()!=year)continue;int mo=k.substring(5,7).toInt(),da=k.substring(8,10).toInt();if(mo<1||mo>12||da<1)continue;int doy=da-1;for(int m=1;m<mo;++m)doy+=mdays[m-1]+(m==2&&leap()?1:0);int w=(offset+doy)/7,d=(offset+doy)%7;fillRect(18+w*(cell+gap),y0+d*(cell+gap),cell,cell,ink());++marked;}
   drawText((String("DIAS MARCADOS: ")+String(marked)).c_str(),18,340,1,ink());drawText("OK MARCA HOY  BACK VOLVER",18,756,1,ink());refreshDisplay(false);
 }
-static void drawGymCompactRow(int row, JsonObject e, bool selected){
-  normalizeExerciseDone(e);
-  int y=214+row*58;
-  int leftX=17;
-  int nameW=292;
-  bool nameSelected=selected&&gymSetFocus<0;
-  if(nameSelected)fillRect(leftX,y,nameW,50,ink());else if(selected)borderT(leftX,y,nameW,50,1);
-  bool nameInk=nameSelected?paper():ink();
-  drawTextClipped(safeText(e,"name"),25,y+7,2,276,nameInk);
-  String meta=String("REPS ")+String(e["reps"]|0)+"   "+String(e["kg"]|0)+" KG";
-  drawTextClipped(meta.c_str(),25,y+31,1,276,nameInk);
-
-  int sets=max(0,e["sets"]|0);
-  JsonArray done=e["done"].as<JsonArray>();
-  const int box=22,gap=5,visible=7,startX=324;
-  int first=0;
-  if(selected&&gymSetFocus>=visible)first=gymSetFocus-visible+1;
-  first=max(0,min(first,max(0,sets-visible)));
-  for(int v=0;v<visible&&first+v<sets;++v){
-    int si=first+v;
-    int x=startX+v*(box+gap);
-    bool focus=selected&&gymSetFocus==si;
-    bool on=done[si]|false;
-    if(focus)fillRect(x-2,y+12,box+4,box+4,ink());
-    bool c=focus?paper():ink();
-    drawRoundedRect(x,y+14,box,box,2,c);
-    if(on)fillRect(x+5,y+19,box-10,box-10,c);
-  }
-  if(sets>visible){
-    String pos=String(first+1)+"-"+String(min(sets,first+visible))+"/"+String(sets);
-    drawTextRaw(pos,382,y+41,1,ink());
-  }
-}
-
 static void renderGymFolder(){
   clearCanvas();drawHeader();JsonArray fs=folders();if(openA<0||openA>=(int)fs.size()){view=View::Root;renderRoot();return;}JsonObject f=fs[openA].as<JsonObject>();
   textClipT(safeText(f,"name"),18,184,2,470);JsonArray es=f["exercises"].as<JsonArray>();int n=es.size();int count=n+1+(editing?1:0);subCursor=clampCursor(subCursor,count);
-  int pageSize=9;int start=(subCursor/pageSize)*pageSize,row=0;
-  for(int i=start;i<count&&row<pageSize;++i,++row){
-    bool sel=subCursor==i;
-    if(i<n)drawGymCompactRow(row,es[i].as<JsonObject>(),sel);
-    else if(i==n)drawRow(row,"+ AGREGAR EJERCICIO",sel);
-    else drawRow(row,"AJUSTES",sel);
-  }
-  drawText("UP/DN EJERCICIO  L/R NOMBRE/SETS  OK",18,740,1,ink());
-  drawText("OK NOMBRE=AJUSTAR   BACK VOLVER",18,758,1,ink());refreshDisplay(false);
+  int start=(subCursor/10)*10,row=0;for(int i=start;i<count&&row<10;++i,++row){bool sel=subCursor==i;if(i<n){JsonObject e=es[i].as<JsonObject>();String r=String(e["sets"]|0)+"X"+String(e["reps"]|0)+" "+String(e["kg"]|0)+"KG";drawRow(row,safeText(e,"name"),sel,false,false,r);}else if(i==n)drawActionRow(row,"+ AGREGAR EJERCICIO",sel);else drawActionRow(row,"AJUSTES",sel);}
+  drawText("OK EJERCICIO  BACK VOLVER",18,756,1,ink());refreshDisplay(false);
 }
 
 static void renderGymExercise(){
@@ -893,40 +801,6 @@ static void renderGrimorio(){
   String tags[30];int tc=0;for(JsonObject n:notebooks())for(const char* t:n["tags"].as<JsonArray>()){bool ex=false;for(int i=0;i<tc;++i)if(tags[i]==t)ex=true;if(!ex&&tc<30)tags[tc++]=t;}
   int count=tc+1;subCursor=clampCursor(subCursor,count);int start=(subCursor/10)*10;for(int r=0;r<10&&start+r<count;++r){int i=start+r;if(i<tc)drawRow(r,tags[i],subCursor==i,false,false,"TAG");else drawRow(r,"SIN ETIQUETA",subCursor==i,false,false,"");}
   drawText("OK VER  BACK VOLVER",18,756,1,ink());refreshDisplay(false);
-}
-
-
-static void renderBleEditor(){
-  clearCanvas();drawHeader();
-  JsonArray ns=notebooks();
-  String title="LIBRETA";
-  if(bleEditorNotebook>=0&&bleEditorNotebook<(int)ns.size())title=safeText(ns[bleEditorNotebook].as<JsonObject>(),"name","LIBRETA");
-  textClipT(title.c_str(),18,184,2,470);
-
-  String status=bleKeyboardConnected?String("TECLADO BLE: ")+bleKeyboardName:String("TECLADO BLE: ")+bleStatus;
-  drawTextClipped(status.c_str(),18,216,1,492,ink());
-  if(!bleKeyboardConnected)drawText("SI PIDE PIN: 123456 + ENTER",18,232,1,ink());
-  lineT(18,250,492,1);
-
-  String shown=bleEditorText;
-  shown.replace("\r","");
-  int tail=max(0,(int)shown.length()-780);
-  shown=shown.substring(tail);
-  int pos=0,y=270;
-  for(int line=0;line<19&&pos<(int)shown.length();++line){
-    int end=min(pos+42,(int)shown.length());
-    int nl=shown.indexOf('\n',pos);
-    if(nl>=pos&&nl<end)end=nl;
-    String part=shown.substring(pos,end);
-    drawTextRaw(asciiUpper(part.c_str()),20,y,1,ink());
-    y+=23;
-    if(nl==end)pos=end+1;else pos=end;
-  }
-  if(!shown.length())drawText("ESCRIBE CON TU TECLADO BLUETOOTH",20,280,1,ink());
-  drawText((String("CARACTERES: ")+String(bleEditorText.length())+(bleEditorDirty?"  *":"")).c_str(),18,720,1,ink());
-  drawText("BACK GUARDAR/SALIR   POWER HOY",18,742,1,ink());
-  drawText("LAYOUT: ESPANOL  BLE HID",18,760,1,ink());
-  refreshDisplay(false);
 }
 
 static void renderSettings(){
@@ -974,7 +848,7 @@ static void renderRecurYear(){clearCanvas();textT("FECHAS ANUALES",18,50,2);Stri
 static void renderMessage(){clearCanvas();textT("MAPLE X3",18,80,3);drawTextClipped(messageText.c_str(),18,220,2,490,ink());drawText("OK / BACK CONTINUAR",18,756,1,ink());refreshDisplay(true);}
 
 static void render(){
-  switch(view){case View::Root:renderRoot();break;case View::HabitYear:renderHabitYear();break;case View::GymFolder:renderGymFolder();break;case View::GymExercise:renderGymExercise();break;case View::Project:renderProject();break;case View::Notebook:renderNotebook();break;case View::NotebookTags:renderNotebookTags();break;case View::Grimorio:renderGrimorio();break;case View::Settings:renderSettings();break;case View::EditMenu:renderEditMenu();break;case View::TextInput:renderTextInput();break;case View::NumberInput:renderNumberInput();break;case View::BleEditor:renderBleEditor();break;case View::Transfer:renderTransfer();break;case View::ImportPicker:renderImportPicker();break;case View::ExportSelect:renderExportSelect();break;case View::RecurFreq:renderRecurFreq();break;case View::RecurWeek:renderRecurWeek();break;case View::RecurMonth:renderRecurMonth();break;case View::RecurYear:renderRecurYear();break;case View::Message:renderMessage();break;}
+  switch(view){case View::Root:renderRoot();break;case View::HabitYear:renderHabitYear();break;case View::GymFolder:renderGymFolder();break;case View::GymExercise:renderGymExercise();break;case View::Project:renderProject();break;case View::Notebook:renderNotebook();break;case View::NotebookTags:renderNotebookTags();break;case View::Grimorio:renderGrimorio();break;case View::Settings:renderSettings();break;case View::EditMenu:renderEditMenu();break;case View::TextInput:renderTextInput();break;case View::NumberInput:renderNumberInput();break;case View::Transfer:renderTransfer();break;case View::ImportPicker:renderImportPicker();break;case View::ExportSelect:renderExportSelect();break;case View::RecurFreq:renderRecurFreq();break;case View::RecurWeek:renderRecurWeek();break;case View::RecurMonth:renderRecurMonth();break;case View::RecurYear:renderRecurYear();break;case View::Message:renderMessage();break;}
 }
 
 // -----------------------------------------------------------------------------
@@ -991,18 +865,15 @@ static void createRecurringRule() {
   applyRecurring();persistState();goPage(Page::Tasks);
 }
 
-static void startBleEditor(int ni);
-static void createNotebookAndOpenEditor();
-
 static void handleRootConfirm(){
   if(cursor==-1){editing=!editing;persistState();render();return;}
   int n;
   if(page==Page::Today){int tn=pendingTaskCount(),hn=habits().size(),pn=pendingProjectCount();if(cursor<tn)toggleTask(pendingTaskAt(cursor));else if(cursor<tn+hn)toggleHabit(habits()[cursor-tn].as<JsonObject>());else if(cursor<tn+hn+pn){ /* Maple v8 muestra el siguiente paso en Hoy sin modificarlo */ }else{view=View::Settings;cursor=0;}render();return;}
   if(page==Page::Habits){n=habits().size();if(cursor<n){if(editing)openEdit(EditKind::Habit,cursor,-1,-1,View::Root);else{openA=cursor;view=View::HabitYear;}}else if(cursor==n)startText(TextTarget::AddHabit,"","NUEVO HABITO",View::Root);else{view=View::Settings;cursor=0;}render();return;}
   if(page==Page::Tasks){n=tasks().size();if(cursor<n){if(editing)openEdit(EditKind::Task,cursor,-1,-1,View::Root);else toggleTask(tasks()[cursor].as<JsonObject>());}else if(cursor==n)startText(TextTarget::AddTask,"","NUEVA TAREA",View::Root);else if(cursor==n+1){recurText="";for(bool&x:recurWeek)x=false;for(bool&x:recurMonth)x=false;memset(recurYear,0,sizeof(recurYear));startText(TextTarget::RecurringText,"","TAREA RECURRENTE",View::Root);}else{view=View::Settings;cursor=0;}render();return;}
-  if(page==Page::Gym){n=folders().size();if(cursor<n){if(editing)openEdit(EditKind::GymFolder,cursor,-1,-1,View::Root);else{openA=cursor;subCursor=0;gymSetFocus=-1;view=View::GymFolder;}}else if(cursor==n)startText(TextTarget::AddGymFolder,"","NUEVA CARPETA",View::Root);else{view=View::Settings;cursor=0;}render();return;}
+  if(page==Page::Gym){n=folders().size();if(cursor<n){if(editing)openEdit(EditKind::GymFolder,cursor,-1,-1,View::Root);else{openA=cursor;subCursor=0;view=View::GymFolder;}}else if(cursor==n)startText(TextTarget::AddGymFolder,"","NUEVA CARPETA",View::Root);else{view=View::Settings;cursor=0;}render();return;}
   if(page==Page::Projects){n=projects().size();if(cursor<n){if(editing)openEdit(EditKind::Project,cursor,-1,-1,View::Root);else{openA=cursor;subCursor=0;view=View::Project;}}else if(cursor==n)startText(TextTarget::AddProject,"","NUEVO PROYECTO",View::Root);else{view=View::Settings;cursor=0;}render();return;}
-  if(page==Page::Write){n=notebooks().size();if(cursor==0){subCursor=0;view=View::Grimorio;}else if(cursor<=n){int ni=cursor-1;if(editing)openEdit(EditKind::Notebook,ni,-1,-1,View::Root);else{openA=ni;openB=0;subCursor=0;view=View::Notebook;}}else if(cursor==n+1){createNotebookAndOpenEditor();return;}else{view=View::Settings;cursor=0;}render();return;}
+  if(page==Page::Write){n=notebooks().size();if(cursor==0){subCursor=0;view=View::Grimorio;}else if(cursor<=n){int ni=cursor-1;if(editing)openEdit(EditKind::Notebook,ni,-1,-1,View::Root);else{openA=ni;openB=0;subCursor=0;view=View::Notebook;}}else if(cursor==n+1)startText(TextTarget::AddNotebook,"","NUEVA LIBRETA",View::Root);else{view=View::Settings;cursor=0;}render();return;}
 }
 
 static void handleEditMenuConfirm(){
@@ -1018,244 +889,13 @@ static void handleTextShortConfirm(){
   render();
 }
 
-
-// -----------------------------------------------------------------------------
-// BLE HID keyboard editor
-// -----------------------------------------------------------------------------
-static bool isKeyInPrev(uint8_t key){
-  for(uint8_t k:blePrevKeys)if(k==key)return true;
-  return false;
-}
-
-static void bleNotifyCB(NimBLERemoteCharacteristic*, uint8_t* data, size_t length, bool){
-  if(!bleKeyQueue||!data||length<8||length>12)return;
-  BleKeyPacket p{};p.len=(uint8_t)min((size_t)12,length);memcpy(p.data,data,p.len);
-  xQueueSend(bleKeyQueue,&p,0);
-}
-
-class MapleBleScanCallbacks : public NimBLEScanCallbacks{
-  void onResult(const NimBLEAdvertisedDevice* d) override{
-    if(!d)return;
-    if(d->isAdvertisingService(NimBLEUUID("1812"))){
-      bleAdvDevice=d;
-      bleKeyboardName=d->haveName()?String(d->getName().c_str()):String("TECLADO");
-      bleStatus="ENCONTRADO";
-      NimBLEDevice::getScan()->stop();
-      bleScanning=false;
-      bleConnectPending=true;
-    }
-  }
-  void onScanEnd(const NimBLEScanResults&, int) override{
-    bleScanning=false;
-    if(!bleConnectPending&&!bleKeyboardConnected)bleStatus="NO ENCONTRADO - OK REINTENTA";
-  }
-};
-MapleBleScanCallbacks mapleBleScanCallbacks;
-
-class MapleBleClientCallbacks : public NimBLEClientCallbacks{
-  void onDisconnect(NimBLEClient*, int) override{
-    bleKeyboardConnected=false;
-    bleStatus="DESCONECTADO - OK REINTENTA";
-  }
-  void onAuthenticationComplete(NimBLEConnInfo& info) override{
-    if(info.isEncrypted())bleStatus="CONECTADO SEGURO";
-  }
-};
-MapleBleClientCallbacks mapleBleClientCallbacks;
-
-static void startBleScan(){
-  if(!bleInitialized){
-    if(!NimBLEDevice::init("Maple-X3")){bleStatus="ERROR INICIANDO BLE";return;}
-    bleInitialized=true;
-    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-    NimBLEDevice::setSecurityPasskey(123456);
-    NimBLEDevice::setSecurityAuth(true,true,true);
-    if(!bleKeyQueue)bleKeyQueue=xQueueCreate(24,sizeof(BleKeyPacket));
-    NimBLEScan* scan=NimBLEDevice::getScan();
-    scan->setScanCallbacks(&mapleBleScanCallbacks,false);
-    scan->setActiveScan(true);
-    scan->setInterval(80);
-    scan->setWindow(60);
-    scan->setMaxResults(0);
-  }
-  if(bleClient&&bleClient->isConnected()){bleKeyboardConnected=true;return;}
-  bleAdvDevice=nullptr;bleConnectPending=false;bleStatus="BUSCANDO TECLADO...";
-  bleScanning=true;
-  NimBLEDevice::getScan()->start(BLE_SCAN_TIME_MS,false,true);
-}
-
-static bool connectBleKeyboard(){
-  if(!bleAdvDevice)return false;
-  bleStatus="CONECTANDO...";
-  if(!bleClient){
-    bleClient=NimBLEDevice::createClient();
-    if(!bleClient){bleStatus="SIN MEMORIA BLE";return false;}
-    bleClient->setClientCallbacks(&mapleBleClientCallbacks,false);
-    bleClient->setConnectTimeout(8000);
-  }
-  if(!bleClient->connect(bleAdvDevice)){bleStatus="NO CONECTO - OK REINTENTA";return false;}
-  bleStatus="EMPAREJANDO - PIN 123456";
-  renderBleEditor();
-  if(!bleClient->secureConnection(false)){bleStatus="ERROR EMPAREJANDO";bleClient->disconnect();return false;}
-  NimBLERemoteService* hid=bleClient->getService(NimBLEUUID("1812"));
-  if(!hid){bleStatus="NO ES TECLADO HID";bleClient->disconnect();return false;}
-  int subscribed=0;
-  const auto& chars=hid->getCharacteristics(true);
-  for(auto* chr:chars){
-    if(!chr||chr->getUUID()!=NimBLEUUID("2A4D"))continue;
-    if(chr->canNotify()){if(chr->subscribe(true,bleNotifyCB))++subscribed;}
-    else if(chr->canIndicate()){if(chr->subscribe(false,bleNotifyCB))++subscribed;}
-  }
-  if(!subscribed){bleStatus="SIN REPORTES DE TECLADO";bleClient->disconnect();return false;}
-  bleKeyboardConnected=true;bleStatus="CONECTADO";
-  memset(blePrevKeys,0,sizeof(blePrevKeys));
-  return true;
-}
-
-static void stopBleEditorConnection(){
-  if(bleScanning&&bleInitialized)NimBLEDevice::getScan()->stop();
-  bleScanning=false;bleConnectPending=false;
-  if(bleClient&&bleClient->isConnected())bleClient->disconnect();
-  bleKeyboardConnected=false;bleAdvDevice=nullptr;bleClient=nullptr;
-  if(bleInitialized){NimBLEDevice::deinit(true);bleInitialized=false;}
-  if(bleKeyQueue){vQueueDelete(bleKeyQueue);bleKeyQueue=nullptr;}
-}
-
-static void saveBleEditor(){
-  if(bleEditorNotebook<0||bleEditorNotebook>=(int)notebooks().size())return;
-  JsonObject n=notebooks()[bleEditorNotebook].as<JsonObject>();
-  n["text"]=bleEditorText;n["updatedAt"]=nowEpochMs();
-  persistState();bleEditorDirty=false;bleEditorLastSave=millis();
-}
-
-static String applyDeadAccent(char dead, char c, bool upper){
-  if(dead=='a'){
-    if(c=='a')return upper?"Á":"á";if(c=='e')return upper?"É":"é";if(c=='i')return upper?"Í":"í";if(c=='o')return upper?"Ó":"ó";if(c=='u')return upper?"Ú":"ú";
-  }
-  if(dead=='u'&&c=='u')return upper?"Ü":"ü";
-  String s;if(dead=='a')s+="´";else if(dead=='u')s+="¨";s+=upper?(char)toupper((unsigned char)c):c;return s;
-}
-
-static String spanishKey(uint8_t code,uint8_t mod){
-  bool shift=(mod&0x22)!=0;
-  bool altgr=(mod&0x40)!=0;
-  bool caps=bleEditorCaps;
-  if(code>=0x04&&code<=0x1d){
-    char c='a'+(code-0x04);bool upper=shift^caps;
-    if(bleDeadKey){char d=bleDeadKey;bleDeadKey=0;return applyDeadAccent(d,c,upper);}
-    String s;s+=(upper?(char)toupper((unsigned char)c):c);return s;
-  }
-  if(code>=0x1e&&code<=0x27){
-    static const char* normal[]={"1","2","3","4","5","6","7","8","9","0"};
-    static const char* shifted[]={"!","\"","·","$","%","&","/","(",")","="};
-    if(altgr){static const char* ag[]={"|","@","#","~","€","","{","[","]","}"};return ag[code-0x1e];}
-    return shift?shifted[code-0x1e]:normal[code-0x1e];
-  }
-  switch(code){
-    case 0x2c:return " ";
-    case 0x2d:return shift?"?":"'";
-    case 0x2e:return shift?"¿":"¡";
-    case 0x2f:return altgr?"[":(shift?"^":"`");
-    case 0x30:return altgr?"]":(shift?"*":"+");
-    case 0x31:return altgr?"\\":(shift?">":"<");
-    case 0x32:return shift?"Ç":"ç";
-    case 0x33:return shift?"Ñ":"ñ";
-    case 0x34:bleDeadKey=shift?'u':'a';return "";
-    case 0x35:return shift?"ª":"º";
-    case 0x36:return shift?";":",";
-    case 0x37:return shift?":":".";
-    case 0x38:return shift?"_":"-";
-    default:return "";
-  }
-}
-
-static void insertEditorText(const String& s){
-  if(!s.length())return;
-  bleEditorCursor=constrain(bleEditorCursor,0,(int)bleEditorText.length());
-  bleEditorText=bleEditorText.substring(0,bleEditorCursor)+s+bleEditorText.substring(bleEditorCursor);
-  bleEditorCursor+=s.length();bleEditorDirty=true;bleEditorLastKey=millis();
-}
-
-static int utf8Prev(const String& t,int pos){
-  pos=constrain(pos,0,(int)t.length());if(pos<=0)return 0;
-  int i=pos-1;while(i>0&&(((uint8_t)t[i]&0xC0)==0x80))--i;return i;
-}
-static int utf8Next(const String& t,int pos){
-  pos=constrain(pos,0,(int)t.length());if(pos>=(int)t.length())return t.length();
-  int i=pos+1;while(i<(int)t.length()&&(((uint8_t)t[i]&0xC0)==0x80))++i;return i;
-}
-
-static void processBleKey(uint8_t code,uint8_t mod){
-  if(!code)return;
-  if(code==0x39){bleEditorCaps=!bleEditorCaps;return;}
-  if(code==0x28){insertEditorText("\n");return;}
-  if(code==0x2a){
-    if(bleEditorCursor>0){int p=utf8Prev(bleEditorText,bleEditorCursor);bleEditorText.remove(p,bleEditorCursor-p);bleEditorCursor=p;bleEditorDirty=true;bleEditorLastKey=millis();}
-    return;
-  }
-  if(code==0x4c){
-    if(bleEditorCursor<(int)bleEditorText.length()){int n=utf8Next(bleEditorText,bleEditorCursor);bleEditorText.remove(bleEditorCursor,n-bleEditorCursor);bleEditorDirty=true;bleEditorLastKey=millis();}
-    return;
-  }
-  if(code==0x50){bleEditorCursor=utf8Prev(bleEditorText,bleEditorCursor);return;}
-  if(code==0x4f){bleEditorCursor=utf8Next(bleEditorText,bleEditorCursor);return;}
-  if(code==0x4a){bleEditorCursor=0;return;}
-  if(code==0x4d){bleEditorCursor=bleEditorText.length();return;}
-  String s=spanishKey(code,mod);insertEditorText(s);
-}
-
-static void serviceBleKeyboard(){
-  if(view!=View::BleEditor)return;
-  if(bleConnectPending){
-    bleConnectPending=false;
-    connectBleKeyboard();
-    renderBleEditor();bleEditorLastRender=millis();
-  }
-  BleKeyPacket p{};
-  bool got=false;
-  while(bleKeyQueue&&xQueueReceive(bleKeyQueue,&p,0)==pdTRUE){
-    got=true;
-    const uint8_t* r=p.data;
-    int len=p.len;
-    if(len==9){++r;--len;} // common HID report-id prefix
-    if(len<8)continue;
-    uint8_t mod=r[0];
-    uint8_t nowKeys[6];memcpy(nowKeys,r+2,6);
-    for(uint8_t k:nowKeys)if(k&&!isKeyInPrev(k))processBleKey(k,mod);
-    memcpy(blePrevKeys,nowKeys,6);
-  }
-  uint32_t now=millis();
-  if(bleEditorDirty&&now-bleEditorLastSave>=BLE_EDITOR_AUTOSAVE_MS)saveBleEditor();
-  if(got&&now-bleEditorLastRender>=BLE_EDITOR_REFRESH_IDLE_MS){
-    renderBleEditor();bleEditorLastRender=now;
-  }
-}
-
-static void startBleEditor(int ni){
-  if(ni<0||ni>=(int)notebooks().size())return;
-  bleEditorNotebook=ni;
-  bleEditorText=safeText(notebooks()[ni].as<JsonObject>(),"text");
-  bleEditorCursor=bleEditorText.length();bleEditorDirty=false;bleEditorCaps=false;bleDeadKey=0;
-  memset(blePrevKeys,0,sizeof(blePrevKeys));
-  view=View::BleEditor;bleStatus=bleKeyboardConnected?"CONECTADO":"BUSCANDO TECLADO...";
-  renderBleEditor();bleEditorLastRender=millis();bleEditorLastSave=millis();
-  if(!bleKeyboardConnected)startBleScan();
-}
-
-static void createNotebookAndOpenEditor(){
-  JsonArray ns=notebooks();
-  String name=String("LIBRETA ")+String(ns.size()+1);
-  JsonObject o=ns.add<JsonObject>();o["id"]=nextId();o["name"]=name;o["text"]="";o["updatedAt"]=nowEpochMs();o["tags"].to<JsonArray>();
-  persistState();openA=ns.size()-1;openB=0;subCursor=0;startBleEditor(openA);
-}
-
 static void handleShortConfirm(){
   if(view==View::Root){handleRootConfirm();return;}
   if(view==View::HabitYear){toggleHabit(habits()[openA].as<JsonObject>());render();return;}
-  if(view==View::GymFolder){JsonArray es=folders()[openA]["exercises"].as<JsonArray>();int n=es.size();if(subCursor<n){JsonObject e=es[subCursor].as<JsonObject>();normalizeExerciseDone(e);if(gymSetFocus>=0){JsonArray d=e["done"].as<JsonArray>();if(gymSetFocus<(int)d.size()){d[gymSetFocus]=!(d[gymSetFocus]|false);persistState();}}else if(editing)openEdit(EditKind::Exercise,openA,subCursor,-1,View::GymFolder);else{openB=subCursor;subCursor=0;view=View::GymExercise;}}else if(subCursor==n)startText(TextTarget::AddExercise,"","NUEVO EJERCICIO",View::GymFolder,openA);else{view=View::Settings;cursor=0;}render();return;}
+  if(view==View::GymFolder){JsonArray es=folders()[openA]["exercises"].as<JsonArray>();int n=es.size();if(subCursor<n){if(editing)openEdit(EditKind::Exercise,openA,subCursor,-1,View::GymFolder);else{openB=subCursor;subCursor=0;view=View::GymExercise;}}else if(subCursor==n)startText(TextTarget::AddExercise,"","NUEVO EJERCICIO",View::GymFolder,openA);else{view=View::Settings;cursor=0;}render();return;}
   if(view==View::GymExercise){JsonObject e=folders()[openA]["exercises"][openB].as<JsonObject>();if(subCursor==0)startNumber(NumberTarget::ExerciseSets,e["sets"]|0,View::GymExercise);else if(subCursor==1)startNumber(NumberTarget::ExerciseReps,e["reps"]|0,View::GymExercise);else if(subCursor==2)startNumber(NumberTarget::ExerciseKg,e["kg"]|0,View::GymExercise);else{normalizeExerciseDone(e);JsonArray d=e["done"].as<JsonArray>();int i=subCursor-3;if(i>=0&&i<(int)d.size())d[i]=!(d[i]|false);persistState();}render();return;}
   if(view==View::Project){ProjectRow r=projectRowAt(openA,subCursor);JsonObject p=projects()[openA].as<JsonObject>();if(r.kind==1){if(editing)openEdit(EditKind::ProjectFolder,openA,r.fi,-1,View::Project);else p["folders"][r.fi]["collapsed"]=!(p["folders"][r.fi]["collapsed"]|false),persistState();}else if(r.kind==2){if(editing)openEdit(EditKind::ProjectStep,openA,r.fi,r.si,View::Project);else{JsonObject st=p["folders"][r.fi]["steps"][r.si].as<JsonObject>();st["done"]=!(st["done"]|false);persistState();}}else if(r.kind==3)startText(TextTarget::AddProjectStep,"","NUEVO PASO",View::Project,openA,r.fi);else if(r.kind==4)startText(TextTarget::AddProjectFolder,"","NUEVA CARPETA",View::Project,openA);else{view=View::Settings;cursor=0;}render();return;}
-  if(view==View::Notebook){if(subCursor==0){startBleEditor(openA);return;}else if(subCursor==1){subCursor=0;view=View::NotebookTags;}else{bool ok=exportNotebookTxt(openA);showMessage(ok?messageText:"NO SE PUDO EXPORTAR",View::Notebook);}render();return;}
+  if(view==View::Notebook){if(subCursor==0){JsonObject n=notebooks()[openA].as<JsonObject>();startText(TextTarget::NotebookText,String((const char*)(n["text"]|"")),"EDITAR LIBRETA",View::Notebook,openA);}else if(subCursor==1){subCursor=0;view=View::NotebookTags;}else{bool ok=exportNotebookTxt(openA);showMessage(ok?messageText:"NO SE PUDO EXPORTAR",View::Notebook);}render();return;}
   if(view==View::NotebookTags){JsonObject n=notebooks()[openA].as<JsonObject>();JsonArray ta=n["tags"].as<JsonArray>();if(subCursor<(int)ta.size()){ta.remove(subCursor);persistState();subCursor=clampCursor(subCursor,ta.size()+1);}else startText(TextTarget::AddNotebookTag,"","AGREGAR TAG",View::NotebookTags,openA);render();return;}
   if(view==View::Grimorio){ // Selecting a tag opens the first matching notebook; keeps navigation simple on physical buttons.
     String tags[30];int tc=0;for(JsonObject n:notebooks())for(const char* t:n["tags"].as<JsonArray>()){bool ex=false;for(int i=0;i<tc;++i)if(tags[i]==t)ex=true;if(!ex&&tc<30)tags[tc++]=t;}
@@ -1278,17 +918,16 @@ static void handleShortConfirm(){
 static void handleLongConfirm(){
   if(view==View::Root){view=View::Transfer;cursor=0;render();return;}
   if(view==View::TextInput){commitText();render();return;}
-  if(view==View::BleEditor){saveBleEditor();renderBleEditor();return;}
 }
 
 static void handleBack(){
-  if(view==View::Root){goPage(Page::Today);render();return;}if(view==View::BleEditor){saveBleEditor();stopBleEditorConnection();view=View::Notebook;openA=bleEditorNotebook;subCursor=0;render();return;}if(view==View::NotebookTags){view=View::Notebook;subCursor=1;render();return;}if(view==View::GymExercise){view=View::GymFolder;subCursor=openB;render();return;}if(view==View::GymFolder||view==View::HabitYear||view==View::Project||view==View::Grimorio){view=View::Root;cursor=max(0,openA);render();return;}if(view==View::Notebook){view=View::Root;cursor=openA+1;render();return;}
+  if(view==View::Root){goPage(Page::Today);render();return;}if(view==View::NotebookTags){view=View::Notebook;subCursor=1;render();return;}if(view==View::GymExercise){view=View::GymFolder;subCursor=openB;render();return;}if(view==View::GymFolder||view==View::HabitYear||view==View::Project||view==View::Grimorio){view=View::Root;cursor=max(0,openA);render();return;}if(view==View::Notebook){view=View::Root;cursor=openA+1;render();return;}
   if(view==View::TextInput){if(inputBuffer.length())inputBuffer.remove(inputBuffer.length()-1);else view=returnView;render();return;}if(view==View::NumberInput){view=returnView;render();return;}if(view==View::EditMenu||view==View::Settings){view=returnView;render();return;}if(view==View::Transfer){view=View::Root;cursor=0;render();return;}if(view==View::ImportPicker||view==View::ExportSelect){view=View::Transfer;cursor=0;render();return;}if(view==View::RecurFreq||view==View::RecurWeek||view==View::RecurMonth||view==View::RecurYear){goPage(Page::Tasks);render();return;}if(view==View::Message){view=messageReturn;render();return;}
 }
 
 static void adjustCurrent(int delta){
   if(view==View::Root){int n=rootCount();cursor=constrain(cursor+delta,-1,max(-1,n-1));}
-  else if(view==View::GymFolder){int n=folders()[openA]["exercises"].as<JsonArray>().size()+1+(editing?1:0);subCursor=clampCursor(subCursor+delta,n);gymSetFocus=-1;}
+  else if(view==View::GymFolder){int n=folders()[openA]["exercises"].as<JsonArray>().size()+1+(editing?1:0);subCursor=clampCursor(subCursor+delta,n);}
   else if(view==View::GymExercise){JsonObject e=folders()[openA]["exercises"][openB].as<JsonObject>();subCursor=clampCursor(subCursor+delta,3+max(0,e["sets"]|0));}
   else if(view==View::Project)subCursor=clampCursor(subCursor+delta,projectRows(openA));
   else if(view==View::Notebook)subCursor=clampCursor(subCursor+delta,3);else if(view==View::NotebookTags){JsonArray ta=notebooks()[openA]["tags"].as<JsonArray>();subCursor=clampCursor(subCursor+delta,ta.size()+1);}
@@ -1301,169 +940,11 @@ static void adjustCurrent(int delta){
 
 static void handleLeftRight(int delta){
   if(view==View::Root){int p=(int)page;goPage((Page)((p+delta+6)%6));render();return;}
-  if(view==View::GymFolder){JsonArray es=folders()[openA]["exercises"].as<JsonArray>();if(subCursor<(int)es.size()){int sets=max(0,(int)(es[subCursor]["sets"]|0));if(delta>0)gymSetFocus=min(sets-1,gymSetFocus+1);else gymSetFocus=max(-1,gymSetFocus-1);render();return;}}
   if(view==View::GymExercise){JsonObject e=folders()[openA]["exercises"][openB].as<JsonObject>();if(subCursor<3){const char* key=subCursor==0?"sets":(subCursor==1?"reps":"kg");int v=e[key]|0;e[key]=max(0,v+delta);if(subCursor==0)normalizeExerciseDone(e);persistState();render();return;}}
   if(view==View::Notebook){String txt=safeText(notebooks()[openA],"text");int pages=max(1,(int)((txt.length()+42*17-1)/(42*17)));openB=constrain(openB+delta,0,pages-1);render();return;}
   if(view==View::TextInput){int row=keyboardIndex/KEY_COLS,col=keyboardIndex%KEY_COLS;col=(col+delta+KEY_COLS)%KEY_COLS;keyboardIndex=min(KEY_COUNT-1,row*KEY_COLS+col);render();return;}
   if(view==View::NumberInput){numberDigit=constrain(numberDigit+delta,0,1);render();return;}
   if(view==View::RecurYear){recurPickMonth=(recurPickMonth+delta+12)%12;render();return;}
-}
-
-// -----------------------------------------------------------------------------
-// Wi-Fi SD sharing mode
-// -----------------------------------------------------------------------------
-static bool isJsonName(const String& name){
-  String low=name;low.toLowerCase();return low.endsWith(".json");
-}
-
-static String sanitizeUploadName(String name){
-  int slash=name.lastIndexOf('/');int back=name.lastIndexOf('\\');int cut=max(slash,back);
-  if(cut>=0)name=name.substring(cut+1);
-  String out;out.reserve(name.length());
-  for(size_t i=0;i<name.length();++i){char c=name[i];
-    bool ok=(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.';
-    if(ok)out+=c;else if(c==' ')out+='-';
-  }
-  if(!out.length())out="maple-import.json";
-  return out;
-}
-
-static String htmlEscape(const String& in){
-  String out;out.reserve(in.length()+16);
-  for(size_t i=0;i<in.length();++i){char c=in[i];
-    if(c=='&')out+="&amp;";else if(c=='<')out+="&lt;";else if(c=='>')out+="&gt;";
-    else if(c=='\"')out+="&quot;";else if(c=='\'')out+="&#39;";else out+=c;
-  }
-  return out;
-}
-
-static bool isManagedJsonPath(const String& path){
-  if(path.indexOf("..")>=0||!path.startsWith("/")||!isJsonName(path))return false;
-  return path.startsWith("/Maple/Import/")||path.startsWith("/Maple/Exports/")||
-         (path.startsWith("/Maple/")&&path.indexOf('/',7)<0)||path.indexOf('/',1)<0;
-}
-
-static bool isProtectedJsonPath(const String& path){
-  return path==STATE_PATH||path==STATE_TMP_PATH;
-}
-
-static void appendJsonDirectory(String& html,const char* dir){
-  if(!storageReady)return;
-  auto files=SdMan.listFiles(dir,60);
-  for(const String& name:files){
-    if(!isJsonName(name))continue;
-    String full=String(dir);
-    if(full!="/"&&!full.endsWith("/"))full+="/";
-    full+=name;
-    html+="<div class='file'><div><strong>"+htmlEscape(name)+"</strong><small>"+htmlEscape(full)+"</small></div>";
-    if(isProtectedJsonPath(full))html+="<span class='protected'>EN USO</span>";
-    else html+="<form method='POST' action='/delete' onsubmit=\"return confirm('¿Eliminar este JSON?');\"><input type='hidden' name='path' value='"+htmlEscape(full)+"'><button class='danger' type='submit'>Eliminar</button></form>";
-    html+="</div>";
-  }
-}
-
-static void sendShareHome(){
-  String html;html.reserve(14000);
-  html=F("<!doctype html><html lang='es'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Maple X3</title><style>"
-         "*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f7f7f3;color:#171717;margin:0;padding:24px}main{max-width:720px;margin:auto}h1{font-size:28px;margin:0 0 4px}h2{font-size:17px;margin:28px 0 10px}p{line-height:1.45;color:#555}.card{background:#fff;border:1px solid #d8d8d2;border-radius:14px;padding:16px;margin:14px 0}.upload{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.file{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid #ecece7;padding:12px 0}.file:first-child{border-top:0}.file small{display:block;color:#777;margin-top:3px;word-break:break-all}button{font:inherit;border:1px solid #222;border-radius:9px;background:#222;color:#fff;padding:9px 13px}button.danger{background:#fff;color:#8c1d18;border-color:#c9a29f}.protected{font-size:12px;color:#777;border:1px solid #ccc;border-radius:999px;padding:5px 8px}.notice{background:#eef6e9;border:1px solid #b9d6ab;border-radius:10px;padding:10px 12px}.meta{font-size:13px;color:#777}input[type=file]{max-width:100%}a{color:inherit}</style></head><body><main>"
-         "<h1>Maple X3</h1><div class='meta'>Administrador local de JSON · microSD</div>"
-         "<p>Esta página vive dentro del XTEINK X3. No necesita Internet. Los JSON nuevos se guardan en <b>/Maple/Import/</b> para que luego puedas importarlos desde Maple.</p>");
-  if(webNotice.length()){html+="<div class='notice'>"+htmlEscape(webNotice)+"</div>";webNotice="";}
-  html+=F("<div class='card'><h2 style='margin-top:0'>Agregar JSON</h2><form class='upload' method='POST' action='/upload' enctype='multipart/form-data'><input type='file' name='file' accept='.json,application/json' required><button type='submit'>Subir a la SD</button></form></div>"
-          "<h2>Archivos JSON</h2><div class='card'>");
-  appendJsonDirectory(html,"/Maple/Import");
-  appendJsonDirectory(html,"/Maple/Exports");
-  appendJsonDirectory(html,"/Maple");
-  appendJsonDirectory(html,"/");
-  html+=F("</div><p class='meta'>El archivo interno <b>maple-x3-state.json</b> aparece como EN USO y no se puede borrar desde esta página.</p>"
-          "<p><a href='/'>Actualizar lista</a></p></main></body></html>");
-  shareServer.send(200,"text/html; charset=utf-8",html);
-}
-
-static void handleWebDelete(){
-  if(!storageReady){shareServer.send(503,"text/plain; charset=utf-8","SD no disponible");return;}
-  String path=shareServer.arg("path");
-  if(!isManagedJsonPath(path)||isProtectedJsonPath(path)){shareServer.send(400,"text/plain; charset=utf-8","Ruta no permitida");return;}
-  if(!SdMan.exists(path.c_str())){webNotice="El archivo ya no existe.";}
-  else if(SdMan.remove(path.c_str()))webNotice="JSON eliminado: "+path;
-  else webNotice="No se pudo eliminar: "+path;
-  shareServer.sendHeader("Location","/");shareServer.send(303,"text/plain","");
-}
-
-static void handleWebUploadData(){
-  HTTPUpload& up=shareServer.upload();
-  if(up.status==UPLOAD_FILE_START){
-    webNotice="";webUploadPath="";
-    if(webUploadFile)webUploadFile.close();
-    if(!storageReady){webNotice="SD no disponible.";return;}
-    String clean=sanitizeUploadName(up.filename);
-    if(!isJsonName(clean)){webNotice="Solo se permiten archivos .json";return;}
-    SdMan.ensureDirectoryExists(IMPORT_DIR);
-    webUploadPath=String(IMPORT_DIR)+"/"+clean;
-    if(SdMan.exists(webUploadPath.c_str()))SdMan.remove(webUploadPath.c_str());
-    webUploadFile=SdMan.open(webUploadPath.c_str(),O_WRITE|O_CREAT|O_TRUNC);
-    if(!webUploadFile){webNotice="No se pudo crear el archivo en la SD.";webUploadPath="";}
-  }else if(up.status==UPLOAD_FILE_WRITE){
-    if(webUploadFile){size_t n=webUploadFile.write(up.buf,up.currentSize);if(n!=up.currentSize)webNotice="Error escribiendo el archivo.";}
-  }else if(up.status==UPLOAD_FILE_END){
-    if(webUploadFile)webUploadFile.close();
-    if(webUploadPath.length()&&!webNotice.length())webNotice="JSON agregado: "+webUploadPath;
-  }else if(up.status==UPLOAD_FILE_ABORTED){
-    if(webUploadFile)webUploadFile.close();
-    if(webUploadPath.length())SdMan.remove(webUploadPath.c_str());
-    webNotice="Carga cancelada.";
-  }
-}
-
-static void configureShareRoutes(){
-  if(shareRoutesReady)return;
-  shareServer.on("/",HTTP_GET,sendShareHome);
-  shareServer.on("/delete",HTTP_POST,handleWebDelete);
-  shareServer.on("/upload",HTTP_POST,[](){shareServer.sendHeader("Location","/");shareServer.send(303,"text/plain","");},handleWebUploadData);
-  shareServer.onNotFound([](){shareServer.sendHeader("Location","/");shareServer.send(302,"text/plain","");});
-  shareRoutesReady=true;
-}
-
-static void renderWifiShare(){
-  clearCanvas();
-  drawTextRaw("COMPARTIR WIFI",24,40,3,ink());
-  drawTextRaw("RED WIFI",24,125,1,ink());
-  drawTextRaw(SHARE_AP_SSID,24,150,3,ink());
-  drawTextRaw("ABRE EN TU TELEFONO",24,245,1,ink());
-  drawTextRaw("http://192.168.4.1",24,275,2,ink());
-  drawTextRaw("ADMINISTRA LOS JSON DE LA SD",24,350,1,ink());
-  drawTextRaw("SUBE NUEVOS O ELIMINA VIEJOS",24,375,1,ink());
-  drawTextRaw("NO HAY INTERNET: ES NORMAL",24,430,1,ink());
-  drawTextRaw("POWER = SALIR A HOY",24,730,1,ink());
-  display.displayBuffer(EInkDisplay::FULL_REFRESH);
-}
-
-static bool startWifiShare(){
-  if(wifiShareMode)return true;
-  if(!storageReady){showMessage("SD NO DISPONIBLE",View::Root);render();return false;}
-  configureShareRoutes();
-  WiFi.mode(WIFI_AP);
-  delay(50);
-  if(!WiFi.softAP(SHARE_AP_SSID)){showMessage("NO SE PUDO CREAR LA RED WIFI",View::Root);render();WiFi.mode(WIFI_OFF);return false;}
-  shareServer.begin();wifiShareMode=true;renderWifiShare();return true;
-}
-
-static void stopWifiShare(){
-  if(!wifiShareMode)return;
-  if(webUploadFile)webUploadFile.close();
-  shareServer.stop();WiFi.softAPdisconnect(true);WiFi.mode(WIFI_OFF);wifiShareMode=false;
-}
-
-static void handleShortPower(){
-  if(view==View::BleEditor){saveBleEditor();stopBleEditorConnection();}
-  if(wifiShareMode)stopWifiShare();
-  goPage(Page::Today);render();
-}
-
-static void handleLongPower(){
-  if(wifiShareMode)return;
-  if(view==View::BleEditor){saveBleEditor();stopBleEditorConnection();}
-  startWifiShare();
 }
 
 bool confirmPending=false;bool confirmLongFired=false;uint32_t confirmStarted=0;
@@ -1474,18 +955,8 @@ static void serviceConfirmHold(){
   if(!held){confirmPending=false;if(!confirmLongFired)handleShortConfirm();}
 }
 
-bool powerPending=false;bool powerLongFired=false;
-static void queuePower(){if(powerPending)return;powerPending=true;powerLongFired=false;}
-static void servicePowerHold(){
-  if(!powerPending)return;bool held=input.isPressed(InputManager::BTN_POWER);unsigned long age=input.getPowerButtonHeldTime();
-  if(held&&age>=POWER_LONG_PRESS_MS&&!powerLongFired){powerLongFired=true;powerPending=false;handleLongPower();return;}
-  if(!held){powerPending=false;if(!powerLongFired)handleShortPower();}
-}
-
 static void handleButton(uint8_t b){
-  if(b==InputManager::BTN_POWER){queuePower();return;}
-  if(wifiShareMode)return;
-  if(b==InputManager::BTN_CONFIRM){if(view==View::BleEditor){if(!bleKeyboardConnected&&!bleScanning)startBleScan();return;}if(view==View::Root||view==View::TextInput)queueConfirm();else handleShortConfirm();return;}
+  if(b==InputManager::BTN_CONFIRM){if(view==View::Root||view==View::TextInput)queueConfirm();else handleShortConfirm();return;}
   if(b==InputManager::BTN_BACK){handleBack();return;}if(b==InputManager::BTN_UP){adjustCurrent(-1);return;}if(b==InputManager::BTN_DOWN){adjustCurrent(1);return;}if(b==InputManager::BTN_LEFT){handleLeftRight(-1);return;}if(b==InputManager::BTN_RIGHT){handleLeftRight(1);return;}
 }
 
@@ -1555,10 +1026,7 @@ void setup(){
 }
 
 void loop(){
-  if(wifiShareMode)shareServer.handleClient();
-  if(view==View::BleEditor)serviceBleKeyboard();
-  uint8_t b=0;while(input.popPress(b))handleButton(b);servicePowerHold();
-  if(!wifiShareMode&&view!=View::BleEditor)serviceConfirmHold();
-  static uint32_t lastMinute=0;if(!wifiShareMode&&view!=View::BleEditor&&millis()-lastMinute>60000){lastMinute=millis();applyRecurring();purgeCompletedAfter2am();}
+  uint8_t b=0;while(input.popPress(b))handleButton(b);serviceConfirmHold();
+  static uint32_t lastMinute=0;if(millis()-lastMinute>60000){lastMinute=millis();applyRecurring();purgeCompletedAfter2am();}
   delay(2);
 }
